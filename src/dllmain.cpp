@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <unordered_set>
 #include <unordered_map>
+#include <array>
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -104,7 +105,7 @@ bool g_WindowVisible = false;
 
 // UI State
 static char g_SearchFilter[256] = "";
-static char g_ApiKeyBuf[256] = "";
+// g_ApiKeyBuf removed — multi-account UI uses local buffers in AddonOptions
 static bool g_ShowApiKey = false;
 static std::vector<HoardAndSeek::SearchResult> g_SearchResults;
 static uint32_t g_SelectedItemId = 0;
@@ -188,6 +189,9 @@ void AddonLoad(AddonAPI_t* aApi);
 void AddonUnload();
 void ProcessKeybind(const char* aIdentifier, bool aIsRelease);
 void AddonRender();
+static void BuildGW2Theme();
+static void PushGW2Theme();
+static void PopGW2Theme();
 void AddonOptions();
 
 // --- Render Helpers ---
@@ -424,30 +428,82 @@ static void RenderResultsList() {
             }
 
             // Expanded: show each location as its own row
+            // Group by account when multiple accounts have locations for this item
             if (open) {
-                for (const auto& loc : result.locations) {
-                    ImGui::TableNextRow();
-                    ImGui::TableNextColumn();
+                // Check if multiple accounts are present in results
+                std::unordered_set<std::string> acct_set;
+                for (const auto& loc : result.locations) acct_set.insert(loc.account);
+                size_t numAccounts = HoardAndSeek::GW2API::GetAccounts().size();
+                bool showAccountHeaders = (numAccounts > 1);
 
-                    // Indent the location text under the tree
-                    ImGui::TreePush("loc");
-                    ImVec4 locColor = GetLocationColor(loc.location);
+                if (showAccountHeaders) {
+                    // Group by account
+                    for (const auto& acct_name : acct_set) {
+                        // Find label
+                        std::string acctDisplay = acct_name;
+                        const auto& accts = HoardAndSeek::GW2API::GetAccounts();
+                        for (const auto& a : accts) {
+                            if (a.account_name == acct_name && !a.label.empty()) {
+                                acctDisplay = a.label;
+                                break;
+                            }
+                        }
 
-                    std::string locLabel;
-                    if (loc.sublocation.empty()) {
-                        locLabel = loc.location;
-                    } else {
-                        locLabel = loc.location + " (" + loc.sublocation + ")";
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::TreePush("acct");
+                        ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.5f, 1.0f), "%s", acctDisplay.c_str());
+                        ImGui::TreePop();
+                        ImGui::TableNextColumn();
+                        // Show subtotal on account line only if this account has multiple locations
+                        int acctLocCount = 0;
+                        int acctTotal = 0;
+                        for (const auto& loc : result.locations) {
+                            if (loc.account == acct_name) { acctLocCount++; acctTotal += loc.count; }
+                        }
+                        if (acctLocCount > 1) {
+                            if (result.item_id == COIN_SYNTH_ID) {
+                                ImGui::Text("%s", FormatCoin(acctTotal).c_str());
+                            } else {
+                                ImGui::Text("%d", acctTotal);
+                            }
+                        }
+
+                        for (const auto& loc : result.locations) {
+                            if (loc.account != acct_name) continue;
+                            ImGui::TableNextRow();
+                            ImGui::TableNextColumn();
+                            ImGui::TreePush("acct");
+                            ImGui::TreePush("loc");
+                            ImVec4 locColor = GetLocationColor(loc.location);
+                            std::string locLabel = loc.sublocation.empty() ? loc.location : loc.location + " (" + loc.sublocation + ")";
+                            ImGui::TextColored(locColor, "%s", locLabel.c_str());
+                            ImGui::TreePop();
+                            ImGui::TreePop();
+                            ImGui::TableNextColumn();
+                            if (result.item_id == COIN_SYNTH_ID) {
+                                ImGui::Text("%s", FormatCoin(loc.count).c_str());
+                            } else {
+                                ImGui::Text("x%d", loc.count);
+                            }
+                        }
                     }
-                    ImGui::TextColored(locColor, "%s", locLabel.c_str());
-                    ImGui::TreePop();
-
-                    // Count column for this location
-                    ImGui::TableNextColumn();
-                    if (result.item_id == COIN_SYNTH_ID) {
-                        ImGui::Text("%s", FormatCoin(loc.count).c_str());
-                    } else {
-                        ImGui::Text("x%d", loc.count);
+                } else {
+                    // Single account or filtered: flat list
+                    for (const auto& loc : result.locations) {
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::TreePush("loc");
+                        ImVec4 locColor = GetLocationColor(loc.location);
+                        std::string locLabel = loc.sublocation.empty() ? loc.location : loc.location + " (" + loc.sublocation + ")";
+                        ImGui::TextColored(locColor, "%s", locLabel.c_str());
+                        ImGui::TreePop();
+                        ImGui::TableNextColumn();
+                        if (result.item_id == COIN_SYNTH_ID) {
+                            ImGui::Text("%s", FormatCoin(loc.count).c_str());
+                        } else {
+                            ImGui::Text("x%d", loc.count);
+                        }
                     }
                 }
                 ImGui::TreePop();
@@ -513,7 +569,7 @@ static uint8_t CheckAddonPermission(const char* requester, const char* event_nam
 void OnQueryItem(void* eventArgs) {
     if (!eventArgs || !APIDefs) return;
     auto* req = (HoardQueryItemRequest*)eventArgs;
-    if (req->api_version != HOARD_API_VERSION) return;
+    if (req->api_version > HOARD_API_VERSION || req->api_version == 0) return;
     if (req->response_event[0] == '\0') return;
     uint8_t perm = CheckAddonPermission(req->requester, EV_HOARD_QUERY_ITEM);
     if (perm != HOARD_STATUS_OK) {
@@ -522,6 +578,12 @@ void OnQueryItem(void* eventArgs) {
         resp->status = perm;
         APIDefs->Events_Raise(req->response_event, resp);
         return;
+    }
+
+    // v3+: read account filter
+    std::string account_filter;
+    if (req->api_version >= 3 && req->account_filter[0] != '\0') {
+        account_filter = std::string(req->account_filter);
     }
 
     auto* resp = new HoardQueryItemResponse{};
@@ -537,17 +599,19 @@ void OnQueryItem(void* eventArgs) {
         strncpy(resp->name, info->name.c_str(), sizeof(resp->name) - 1);
         strncpy(resp->rarity, info->rarity.c_str(), sizeof(resp->rarity) - 1);
         strncpy(resp->type, info->type.c_str(), sizeof(resp->type) - 1);
+
     }
 
     // Fill locations
-    auto locations = HoardAndSeek::GW2API::GetItemLocations(req->item_id);
+    auto locations = HoardAndSeek::GW2API::GetItemLocations(req->item_id, account_filter);
     for (const auto& loc : locations) {
         resp->total_count += loc.count;
-        if (resp->location_count < 32) {
+        if (resp->location_count < 64) {
             auto& entry = resp->locations[resp->location_count];
             strncpy(entry.location, loc.location.c_str(), sizeof(entry.location) - 1);
             strncpy(entry.sublocation, loc.sublocation.c_str(), sizeof(entry.sublocation) - 1);
             entry.count = loc.count;
+            strncpy(entry.account_name, loc.account.c_str(), sizeof(entry.account_name) - 1);
             resp->location_count++;
         }
     }
@@ -559,7 +623,7 @@ void OnQueryItem(void* eventArgs) {
 void OnQueryWallet(void* eventArgs) {
     if (!eventArgs || !APIDefs) return;
     auto* req = (HoardQueryWalletRequest*)eventArgs;
-    if (req->api_version != HOARD_API_VERSION) return;
+    if (req->api_version > HOARD_API_VERSION || req->api_version == 0) return;
     if (req->response_event[0] == '\0') return;
     uint8_t perm = CheckAddonPermission(req->requester, EV_HOARD_QUERY_WALLET);
     if (perm != HOARD_STATUS_OK) {
@@ -568,6 +632,12 @@ void OnQueryWallet(void* eventArgs) {
         resp->status = perm;
         APIDefs->Events_Raise(req->response_event, resp);
         return;
+    }
+
+    // v3+: read account filter
+    std::string account_filter;
+    if (req->api_version >= 3 && req->account_filter[0] != '\0') {
+        account_filter = std::string(req->account_filter);
     }
 
     auto* resp = new HoardQueryWalletResponse{};
@@ -585,7 +655,7 @@ void OnQueryWallet(void* eventArgs) {
         resp->found = true;
     }
 
-    resp->amount = HoardAndSeek::GW2API::GetTotalCount(synth_id);
+    resp->amount = HoardAndSeek::GW2API::GetTotalCount(synth_id, account_filter);
 
     APIDefs->Events_Raise(req->response_event, resp);
     // Caller is responsible for freeing resp via delete
@@ -594,13 +664,14 @@ void OnQueryWallet(void* eventArgs) {
 void OnQueryAchievement(void* eventArgs) {
     if (!eventArgs || !APIDefs) return;
     auto* req = (HoardQueryAchievementRequest*)eventArgs;
-    if (req->api_version != HOARD_API_VERSION) return;
+    if (req->api_version > HOARD_API_VERSION || req->api_version == 0) return;
     if (req->response_event[0] == '\0' || req->id_count == 0) return;
     uint8_t perm = CheckAddonPermission(req->requester, EV_HOARD_QUERY_ACHIEVEMENT);
     if (perm != HOARD_STATUS_OK) {
         auto* resp = new HoardQueryAchievementResponse{};
         resp->api_version = HOARD_API_VERSION;
         resp->status = perm;
+        strncpy(resp->account_name, req->account_name, sizeof(resp->account_name) - 1);
         APIDefs->Events_Raise(req->response_event, resp);
         return;
     }
@@ -608,11 +679,13 @@ void OnQueryAchievement(void* eventArgs) {
     // Copy request data for the thread
     std::vector<uint32_t> ids(req->ids, req->ids + std::min(req->id_count, (uint32_t)200));
     std::string response_event(req->response_event);
+    std::string account_name(req->account_name);
 
-    std::thread([ids, response_event]() {
+    std::thread([ids, response_event, account_name]() {
         auto* resp = new HoardQueryAchievementResponse{};
         resp->api_version = HOARD_API_VERSION;
         resp->status = HOARD_STATUS_OK;
+        strncpy(resp->account_name, account_name.c_str(), sizeof(resp->account_name) - 1);
         resp->entry_count = 0;
 
         // Build comma-separated ID list
@@ -623,7 +696,7 @@ void OnQueryAchievement(void* eventArgs) {
         }
 
         std::string url = "https://api.guildwars2.com/v2/account/achievements?ids=" + ids_param;
-        std::string raw = HoardAndSeek::GW2API::AuthenticatedGet(url);
+        std::string raw = HoardAndSeek::GW2API::AuthenticatedGet(url, account_name);
         if (!raw.empty()) {
             try {
                 auto j = nlohmann::json::parse(raw);
@@ -656,13 +729,14 @@ void OnQueryAchievement(void* eventArgs) {
 void OnQueryMastery(void* eventArgs) {
     if (!eventArgs || !APIDefs) return;
     auto* req = (HoardQueryMasteryRequest*)eventArgs;
-    if (req->api_version != HOARD_API_VERSION) return;
+    if (req->api_version > HOARD_API_VERSION || req->api_version == 0) return;
     if (req->response_event[0] == '\0' || req->id_count == 0) return;
     uint8_t perm = CheckAddonPermission(req->requester, EV_HOARD_QUERY_MASTERY);
     if (perm != HOARD_STATUS_OK) {
         auto* resp = new HoardQueryMasteryResponse{};
         resp->api_version = HOARD_API_VERSION;
         resp->status = perm;
+        strncpy(resp->account_name, req->account_name, sizeof(resp->account_name) - 1);
         APIDefs->Events_Raise(req->response_event, resp);
         return;
     }
@@ -670,16 +744,18 @@ void OnQueryMastery(void* eventArgs) {
     // Copy request data for the thread
     std::vector<uint32_t> ids(req->ids, req->ids + std::min(req->id_count, (uint32_t)200));
     std::string response_event(req->response_event);
+    std::string account_name(req->account_name);
 
-    std::thread([ids, response_event]() {
+    std::thread([ids, response_event, account_name]() {
         auto* resp = new HoardQueryMasteryResponse{};
         resp->api_version = HOARD_API_VERSION;
         resp->status = HOARD_STATUS_OK;
+        strncpy(resp->account_name, account_name.c_str(), sizeof(resp->account_name) - 1);
         resp->entry_count = 0;
 
         // /v2/account/masteries returns all masteries; we filter to requested IDs
         std::string url = "https://api.guildwars2.com/v2/account/masteries";
-        std::string raw = HoardAndSeek::GW2API::AuthenticatedGet(url);
+        std::string raw = HoardAndSeek::GW2API::AuthenticatedGet(url, account_name);
         if (!raw.empty()) {
             try {
                 auto j = nlohmann::json::parse(raw);
@@ -708,29 +784,32 @@ void OnQueryMastery(void* eventArgs) {
 void OnQuerySkins(void* eventArgs) {
     if (!eventArgs || !APIDefs) return;
     auto* req = (HoardQuerySkinsRequest*)eventArgs;
-    if (req->api_version != HOARD_API_VERSION) return;
+    if (req->api_version > HOARD_API_VERSION || req->api_version == 0) return;
     if (req->response_event[0] == '\0' || req->id_count == 0) return;
     uint8_t perm = CheckAddonPermission(req->requester, EV_HOARD_QUERY_SKINS);
     if (perm != HOARD_STATUS_OK) {
         auto* resp = new HoardQuerySkinsResponse{};
         resp->api_version = HOARD_API_VERSION;
         resp->status = perm;
+        strncpy(resp->account_name, req->account_name, sizeof(resp->account_name) - 1);
         APIDefs->Events_Raise(req->response_event, resp);
         return;
     }
 
     std::vector<uint32_t> ids(req->ids, req->ids + std::min(req->id_count, (uint32_t)200));
     std::string response_event(req->response_event);
+    std::string account_name(req->account_name);
 
-    std::thread([ids, response_event]() {
+    std::thread([ids, response_event, account_name]() {
         auto* resp = new HoardQuerySkinsResponse{};
         resp->api_version = HOARD_API_VERSION;
         resp->status = HOARD_STATUS_OK;
+        strncpy(resp->account_name, account_name.c_str(), sizeof(resp->account_name) - 1);
         resp->entry_count = 0;
 
         // /v2/account/skins returns all unlocked skin IDs; we filter to requested
         std::string url = "https://api.guildwars2.com/v2/account/skins";
-        std::string raw = HoardAndSeek::GW2API::AuthenticatedGet(url);
+        std::string raw = HoardAndSeek::GW2API::AuthenticatedGet(url, account_name);
         std::unordered_set<uint32_t> unlocked;
         if (!raw.empty()) {
             try {
@@ -757,29 +836,32 @@ void OnQuerySkins(void* eventArgs) {
 void OnQueryRecipes(void* eventArgs) {
     if (!eventArgs || !APIDefs) return;
     auto* req = (HoardQueryRecipesRequest*)eventArgs;
-    if (req->api_version != HOARD_API_VERSION) return;
+    if (req->api_version > HOARD_API_VERSION || req->api_version == 0) return;
     if (req->response_event[0] == '\0' || req->id_count == 0) return;
     uint8_t perm = CheckAddonPermission(req->requester, EV_HOARD_QUERY_RECIPES);
     if (perm != HOARD_STATUS_OK) {
         auto* resp = new HoardQueryRecipesResponse{};
         resp->api_version = HOARD_API_VERSION;
         resp->status = perm;
+        strncpy(resp->account_name, req->account_name, sizeof(resp->account_name) - 1);
         APIDefs->Events_Raise(req->response_event, resp);
         return;
     }
 
     std::vector<uint32_t> ids(req->ids, req->ids + std::min(req->id_count, (uint32_t)200));
     std::string response_event(req->response_event);
+    std::string account_name(req->account_name);
 
-    std::thread([ids, response_event]() {
+    std::thread([ids, response_event, account_name]() {
         auto* resp = new HoardQueryRecipesResponse{};
         resp->api_version = HOARD_API_VERSION;
         resp->status = HOARD_STATUS_OK;
+        strncpy(resp->account_name, account_name.c_str(), sizeof(resp->account_name) - 1);
         resp->entry_count = 0;
 
         // /v2/account/recipes returns all unlocked recipe IDs; we filter to requested
         std::string url = "https://api.guildwars2.com/v2/account/recipes";
-        std::string raw = HoardAndSeek::GW2API::AuthenticatedGet(url);
+        std::string raw = HoardAndSeek::GW2API::AuthenticatedGet(url, account_name);
         std::unordered_set<uint32_t> unlocked;
         if (!raw.empty()) {
             try {
@@ -806,24 +888,27 @@ void OnQueryRecipes(void* eventArgs) {
 void OnQueryWizardsVault(void* eventArgs) {
     if (!eventArgs || !APIDefs) return;
     auto* req = (HoardQueryWizardsVaultRequest*)eventArgs;
-    if (req->api_version != HOARD_API_VERSION) return;
+    if (req->api_version > HOARD_API_VERSION || req->api_version == 0) return;
     if (req->response_event[0] == '\0') return;
     uint8_t perm = CheckAddonPermission(req->requester, EV_HOARD_QUERY_WIZARDSVAULT);
     if (perm != HOARD_STATUS_OK) {
         auto* resp = new HoardQueryWizardsVaultResponse{};
         resp->api_version = HOARD_API_VERSION;
         resp->status = perm;
+        strncpy(resp->account_name, req->account_name, sizeof(resp->account_name) - 1);
         APIDefs->Events_Raise(req->response_event, resp);
         return;
     }
 
     uint8_t type = req->type;
     std::string response_event(req->response_event);
+    std::string account_name(req->account_name);
 
-    std::thread([type, response_event]() {
+    std::thread([type, response_event, account_name]() {
         auto* resp = new HoardQueryWizardsVaultResponse{};
         resp->api_version = HOARD_API_VERSION;
         resp->status = HOARD_STATUS_OK;
+        strncpy(resp->account_name, account_name.c_str(), sizeof(resp->account_name) - 1);
         resp->type = type;
         resp->objective_count = 0;
 
@@ -837,7 +922,7 @@ void OnQueryWizardsVault(void* eventArgs) {
             return;
         }
 
-        std::string raw = HoardAndSeek::GW2API::AuthenticatedGet(endpoints[type]);
+        std::string raw = HoardAndSeek::GW2API::AuthenticatedGet(endpoints[type], account_name);
         if (!raw.empty()) {
             try {
                 auto j = nlohmann::json::parse(raw);
@@ -874,13 +959,14 @@ void OnQueryWizardsVault(void* eventArgs) {
 void OnQueryApi(void* eventArgs) {
     if (!eventArgs || !APIDefs) return;
     auto* req = (HoardQueryApiRequest*)eventArgs;
-    if (req->api_version != HOARD_API_VERSION) return;
+    if (req->api_version > HOARD_API_VERSION || req->api_version == 0) return;
     if (req->response_event[0] == '\0' || req->endpoint[0] == '\0') return;
     uint8_t perm = CheckAddonPermission(req->requester, EV_HOARD_QUERY_API);
     if (perm != HOARD_STATUS_OK) {
         auto* resp = new HoardQueryApiResponse{};
         resp->api_version = HOARD_API_VERSION;
         resp->status = perm;
+        strncpy(resp->account_name, req->account_name, sizeof(resp->account_name) - 1);
         strncpy(resp->endpoint, req->endpoint, sizeof(resp->endpoint) - 1);
         resp->endpoint[sizeof(resp->endpoint) - 1] = '\0';
         APIDefs->Events_Raise(req->response_event, resp);
@@ -889,16 +975,22 @@ void OnQueryApi(void* eventArgs) {
 
     std::string endpoint(req->endpoint);
     std::string response_event(req->response_event);
+    // v3+: read account name for key selection
+    std::string account_name;
+    if (req->api_version >= 3 && req->account_name[0] != '\0') {
+        account_name = std::string(req->account_name);
+    }
 
-    std::thread([endpoint, response_event]() {
+    std::thread([endpoint, response_event, account_name]() {
         auto* resp = new HoardQueryApiResponse{};
         resp->api_version = HOARD_API_VERSION;
         resp->status = HOARD_STATUS_OK;
+        strncpy(resp->account_name, account_name.c_str(), sizeof(resp->account_name) - 1);
         strncpy(resp->endpoint, endpoint.c_str(), sizeof(resp->endpoint) - 1);
         resp->endpoint[sizeof(resp->endpoint) - 1] = '\0';
 
         std::string url = "https://api.guildwars2.com" + endpoint;
-        std::string raw = HoardAndSeek::GW2API::AuthenticatedGet(url);
+        std::string raw = HoardAndSeek::GW2API::AuthenticatedGet(url, account_name);
 
         resp->json_length = (uint32_t)raw.length();
         if (raw.length() >= sizeof(resp->json)) {
@@ -918,7 +1010,7 @@ void OnQueryApi(void* eventArgs) {
 void OnContextMenuRegister(void* eventArgs) {
     if (!eventArgs) return;
     auto* reg = (HoardContextMenuRegister*)eventArgs;
-    if (reg->api_version != HOARD_API_VERSION) return;
+    if (reg->api_version > HOARD_API_VERSION || reg->api_version == 0) return;
     if (reg->id[0] == '\0' || reg->requester[0] == '\0' || reg->label[0] == '\0' || reg->callback_event[0] == '\0') return;
     ContextMenuItem item;
     item.signature = reg->signature;
@@ -1005,6 +1097,7 @@ void OnPing(void* eventArgs) {
     pong.last_updated = (int64_t)HoardAndSeek::GW2API::GetLastUpdated();
     pong.refresh_available_at = (int64_t)HoardAndSeek::GW2API::GetRefreshAvailableAt();
     pong.has_data = HoardAndSeek::GW2API::HasAccountData() ? 1 : 0;
+    pong.account_count = (uint32_t)HoardAndSeek::GW2API::GetAccountCount();
     APIDefs->Events_Raise(EV_HOARD_PONG, &pong);
 }
 
@@ -1030,7 +1123,48 @@ static void BroadcastDataUpdated() {
     payload.currency_count = 0;
     payload.last_updated = (int64_t)HoardAndSeek::GW2API::GetLastUpdated();
     payload.refresh_available_at = (int64_t)HoardAndSeek::GW2API::GetRefreshAvailableAt();
+    payload.account_name[0] = '\0'; // all accounts
+    payload.account_count = (uint32_t)HoardAndSeek::GW2API::GetAccountCount();
     APIDefs->Events_Raise(EV_HOARD_DATA_UPDATED, &payload);
+}
+
+void OnQueryAccounts(void* eventArgs) {
+    if (!eventArgs || !APIDefs) return;
+    auto* req = (HoardQueryAccountsRequest*)eventArgs;
+    if (req->api_version > HOARD_API_VERSION || req->api_version == 0) return;
+    if (req->response_event[0] == '\0') return;
+    uint8_t perm = CheckAddonPermission(req->requester, EV_HOARD_QUERY_ACCOUNTS);
+    if (perm != HOARD_STATUS_OK) {
+        auto* resp = new HoardQueryAccountsResponse{};
+        resp->api_version = HOARD_API_VERSION;
+        resp->status = perm;
+        APIDefs->Events_Raise(req->response_event, resp);
+        return;
+    }
+
+    auto* resp = new HoardQueryAccountsResponse{};
+    resp->api_version = HOARD_API_VERSION;
+    resp->status = HOARD_STATUS_OK;
+    resp->account_count = 0;
+
+    const auto& accounts = HoardAndSeek::GW2API::GetAccounts();
+    for (size_t i = 0; i < accounts.size() && i < 16; i++) {
+        auto& entry = resp->accounts[resp->account_count];
+        strncpy(entry.account_name, accounts[i].account_name.c_str(), sizeof(entry.account_name) - 1);
+        strncpy(entry.label, accounts[i].label.c_str(), sizeof(entry.label) - 1);
+        entry.last_updated = (int64_t)accounts[i].last_updated;
+        entry.validated = accounts[i].validated ? 1 : 0;
+        entry.character_count = 0;
+        for (size_t c = 0; c < accounts[i].characters.size() && c < 80; c++) {
+            strncpy(entry.characters[entry.character_count], accounts[i].characters[c].c_str(),
+                    sizeof(entry.characters[0]) - 1);
+            entry.characters[entry.character_count][sizeof(entry.characters[0]) - 1] = '\0';
+            entry.character_count++;
+        }
+        resp->account_count++;
+    }
+
+    APIDefs->Events_Raise(req->response_event, resp);
 }
 
 // --- Addon Lifecycle ---
@@ -1041,15 +1175,17 @@ void AddonLoad(AddonAPI_t* aApi) {
     ImGui::SetAllocatorFunctions((void* (*)(size_t, void*))APIDefs->ImguiMalloc,
                                  (void(*)(void*, void*))APIDefs->ImguiFree);
 
+    // Build GW2 theme (must be after ImGui context is set)
+    BuildGW2Theme();
+
     // Initialize icon manager
     HoardAndSeek::IconManager::Initialize(APIDefs);
 
-    // Load saved API key and account data
-    if (HoardAndSeek::GW2API::LoadApiKey()) {
-        const auto& key = HoardAndSeek::GW2API::GetApiKey();
-        strncpy(g_ApiKeyBuf, key.c_str(), sizeof(g_ApiKeyBuf) - 1);
-        APIDefs->Log(LOGL_INFO, "HoardAndSeek", "API key loaded from config");
-        HoardAndSeek::GW2API::ValidateApiKeyAsync();
+    // Load saved accounts and account data
+    if (HoardAndSeek::GW2API::LoadAccounts()) {
+        APIDefs->Log(LOGL_INFO, "HoardAndSeek", "Accounts loaded from config");
+        HoardAndSeek::GW2API::ValidateAllAccountsAsync();
+        HoardAndSeek::GW2API::FetchMissingCharacterListsAsync();
     }
     HoardAndSeek::GW2API::LoadAccountData();
     HoardAndSeek::GW2API::LoadTooltips();
@@ -1092,6 +1228,12 @@ void AddonLoad(AddonAPI_t* aApi) {
     APIDefs->Events_Subscribe(EV_HOARD_CONTEXT_MENU_REMOVE, OnContextMenuRemove);
     APIDefs->Events_Subscribe(EV_ADDON_UNLOADED, OnAddonUnloaded);
     APIDefs->Events_Subscribe(EV_HOARD_PING, OnPing);
+    APIDefs->Events_Subscribe(EV_HOARD_QUERY_ACCOUNTS, OnQueryAccounts);
+
+    // Notify other addons that cached data is available
+    if (HoardAndSeek::GW2API::HasAccountData()) {
+        BroadcastDataUpdated();
+    }
 
     APIDefs->Log(LOGL_INFO, "HoardAndSeek", "Addon loaded successfully");
 }
@@ -1113,6 +1255,7 @@ void AddonUnload() {
     APIDefs->Events_Unsubscribe(EV_HOARD_CONTEXT_MENU_REMOVE, OnContextMenuRemove);
     APIDefs->Events_Unsubscribe(EV_ADDON_UNLOADED, OnAddonUnloaded);
     APIDefs->Events_Unsubscribe(EV_HOARD_PING, OnPing);
+    APIDefs->Events_Unsubscribe(EV_HOARD_QUERY_ACCOUNTS, OnQueryAccounts);
     APIDefs->GUI_DeregisterCloseOnEscape("Hoard & Seek");
     APIDefs->QuickAccess_Remove(QA_ID);
     APIDefs->GUI_Deregister(AddonOptions);
@@ -1134,11 +1277,141 @@ void ProcessKeybind(const char* aIdentifier, bool aIsRelease) {
     }
 }
 
+// --- GW2 Theme (matches Alter Ego) ---
+
+static ImGuiStyle g_GW2Style;
+static std::vector<ImGuiStyle> g_StyleStack;
+
+static void PushGW2Theme() {
+    g_StyleStack.push_back(ImGui::GetStyle());
+    ImGui::GetStyle() = g_GW2Style;
+}
+
+static void PopGW2Theme() {
+    if (!g_StyleStack.empty()) {
+        ImGui::GetStyle() = g_StyleStack.back();
+        g_StyleStack.pop_back();
+    }
+}
+
+static void BuildGW2Theme() {
+    g_GW2Style = ImGui::GetStyle();
+    ImGuiStyle& s = g_GW2Style;
+
+    // Rounding
+    s.WindowRounding    = 6.0f;
+    s.ChildRounding     = 4.0f;
+    s.FrameRounding     = 4.0f;
+    s.PopupRounding     = 4.0f;
+    s.ScrollbarRounding = 6.0f;
+    s.GrabRounding      = 3.0f;
+    s.TabRounding       = 4.0f;
+
+    // Spacing & padding
+    s.WindowPadding     = ImVec2(10, 10);
+    s.FramePadding      = ImVec2(6, 4);
+    s.ItemSpacing       = ImVec2(8, 5);
+    s.ItemInnerSpacing  = ImVec2(6, 4);
+    s.ScrollbarSize     = 12.0f;
+    s.GrabMinSize       = 8.0f;
+    s.WindowBorderSize  = 1.0f;
+    s.ChildBorderSize   = 1.0f;
+    s.PopupBorderSize   = 1.0f;
+    s.FrameBorderSize   = 0.0f;
+    s.TabBorderSize     = 0.0f;
+
+    // Colors — dark slate base with warm gold accents
+    ImVec4* c = s.Colors;
+
+    // Backgrounds
+    c[ImGuiCol_WindowBg]             = ImVec4(0.08f, 0.08f, 0.10f, 0.96f);
+    c[ImGuiCol_ChildBg]              = ImVec4(0.07f, 0.07f, 0.09f, 0.80f);
+    c[ImGuiCol_PopupBg]              = ImVec4(0.10f, 0.10f, 0.12f, 0.96f);
+
+    // Borders
+    c[ImGuiCol_Border]               = ImVec4(0.28f, 0.25f, 0.18f, 0.50f);
+    c[ImGuiCol_BorderShadow]         = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+
+    // Frames (input boxes, combos)
+    c[ImGuiCol_FrameBg]              = ImVec4(0.14f, 0.13f, 0.11f, 0.80f);
+    c[ImGuiCol_FrameBgHovered]       = ImVec4(0.22f, 0.20f, 0.14f, 0.80f);
+    c[ImGuiCol_FrameBgActive]        = ImVec4(0.28f, 0.25f, 0.16f, 0.90f);
+
+    // Title bar
+    c[ImGuiCol_TitleBg]              = ImVec4(0.10f, 0.09f, 0.07f, 1.00f);
+    c[ImGuiCol_TitleBgActive]        = ImVec4(0.16f, 0.14f, 0.08f, 1.00f);
+    c[ImGuiCol_TitleBgCollapsed]     = ImVec4(0.08f, 0.07f, 0.05f, 0.75f);
+
+    // Menu bar
+    c[ImGuiCol_MenuBarBg]            = ImVec4(0.12f, 0.11f, 0.09f, 1.00f);
+
+    // Scrollbar
+    c[ImGuiCol_ScrollbarBg]          = ImVec4(0.06f, 0.06f, 0.07f, 0.60f);
+    c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.30f, 0.27f, 0.18f, 0.80f);
+    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.40f, 0.36f, 0.22f, 0.90f);
+    c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.50f, 0.44f, 0.26f, 1.00f);
+
+    // Checkmark, slider
+    c[ImGuiCol_CheckMark]            = ImVec4(0.90f, 0.75f, 0.25f, 1.00f);
+    c[ImGuiCol_SliderGrab]           = ImVec4(0.70f, 0.58f, 0.20f, 1.00f);
+    c[ImGuiCol_SliderGrabActive]     = ImVec4(0.85f, 0.70f, 0.25f, 1.00f);
+
+    // Buttons — warm gold
+    c[ImGuiCol_Button]               = ImVec4(0.22f, 0.20f, 0.12f, 0.80f);
+    c[ImGuiCol_ButtonHovered]        = ImVec4(0.35f, 0.30f, 0.14f, 0.90f);
+    c[ImGuiCol_ButtonActive]         = ImVec4(0.45f, 0.38f, 0.16f, 1.00f);
+
+    // Headers (selectables, collapsing headers)
+    c[ImGuiCol_Header]               = ImVec4(0.18f, 0.16f, 0.10f, 0.70f);
+    c[ImGuiCol_HeaderHovered]        = ImVec4(0.28f, 0.24f, 0.12f, 0.80f);
+    c[ImGuiCol_HeaderActive]         = ImVec4(0.35f, 0.30f, 0.14f, 0.90f);
+
+    // Separator
+    c[ImGuiCol_Separator]            = ImVec4(0.28f, 0.25f, 0.18f, 0.40f);
+    c[ImGuiCol_SeparatorHovered]     = ImVec4(0.50f, 0.42f, 0.20f, 0.70f);
+    c[ImGuiCol_SeparatorActive]      = ImVec4(0.65f, 0.55f, 0.25f, 1.00f);
+
+    // Resize grip
+    c[ImGuiCol_ResizeGrip]           = ImVec4(0.30f, 0.27f, 0.18f, 0.30f);
+    c[ImGuiCol_ResizeGripHovered]    = ImVec4(0.50f, 0.44f, 0.26f, 0.60f);
+    c[ImGuiCol_ResizeGripActive]     = ImVec4(0.65f, 0.55f, 0.25f, 0.90f);
+
+    // Tabs — gold accent for active
+    c[ImGuiCol_Tab]                  = ImVec4(0.14f, 0.13f, 0.10f, 0.86f);
+    c[ImGuiCol_TabHovered]           = ImVec4(0.35f, 0.30f, 0.14f, 0.90f);
+    c[ImGuiCol_TabActive]            = ImVec4(0.28f, 0.24f, 0.10f, 1.00f);
+    c[ImGuiCol_TabUnfocused]         = ImVec4(0.10f, 0.09f, 0.07f, 0.97f);
+    c[ImGuiCol_TabUnfocusedActive]   = ImVec4(0.18f, 0.16f, 0.10f, 1.00f);
+
+    // Text
+    c[ImGuiCol_Text]                 = ImVec4(0.90f, 0.87f, 0.78f, 1.00f);
+    c[ImGuiCol_TextDisabled]         = ImVec4(0.50f, 0.47f, 0.40f, 1.00f);
+
+    // Modal dim background
+    c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0.00f, 0.00f, 0.00f, 0.60f);
+
+    // Nav highlight
+    c[ImGuiCol_NavHighlight]         = ImVec4(0.70f, 0.58f, 0.20f, 1.00f);
+
+    // Table
+    c[ImGuiCol_TableHeaderBg]        = ImVec4(0.14f, 0.13f, 0.10f, 1.00f);
+    c[ImGuiCol_TableBorderStrong]    = ImVec4(0.28f, 0.25f, 0.18f, 0.60f);
+    c[ImGuiCol_TableBorderLight]     = ImVec4(0.22f, 0.20f, 0.15f, 0.40f);
+    c[ImGuiCol_TableRowBg]           = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    c[ImGuiCol_TableRowBgAlt]        = ImVec4(0.10f, 0.10f, 0.08f, 0.30f);
+
+    // Plot (progress bars)
+    c[ImGuiCol_PlotHistogram]        = ImVec4(0.65f, 0.55f, 0.15f, 1.00f);
+    c[ImGuiCol_PlotHistogramHovered] = ImVec4(0.80f, 0.68f, 0.20f, 1.00f);
+}
+
 // --- Main Render ---
 
 void AddonRender() {
     // Process icon download queue every frame (even when window hidden)
     HoardAndSeek::IconManager::Tick();
+
+    PushGW2Theme();
 
     // Render permission popup (always, even if main window is hidden)
     HoardAndSeek::PermissionManager::RenderPopup();
@@ -1212,27 +1485,95 @@ void AddonRender() {
         s_prevFetchStatus = curStatus;
     }
 
-    if (!g_WindowVisible) return;
+    if (!g_WindowVisible) { PopGW2Theme(); return; }
 
     ImGui::SetNextWindowSizeConstraints(ImVec2(250, 150), ImVec2(FLT_MAX, FLT_MAX));
     if (!ImGui::Begin("Hoard & Seek", &g_WindowVisible,
         ImGuiWindowFlags_NoCollapse))
     {
         ImGui::End();
+        PopGW2Theme();
         return;
     }
 
     // Row 1: Refresh button + status message (always on same line)
     auto fetchStatus = HoardAndSeek::GW2API::GetFetchStatus();
     bool scanning = (fetchStatus == HoardAndSeek::FetchStatus::InProgress);
-    bool onCooldown = HoardAndSeek::GW2API::IsRefreshOnCooldown();
-    bool disabled = scanning || onCooldown;
+    bool allOnCooldown = HoardAndSeek::GW2API::IsRefreshOnCooldown();
+    bool disabled = scanning || allOnCooldown;
+
+    // Refresh checklist popup state
+    static bool s_showRefreshPopup = false;
+    static std::vector<std::pair<std::string, bool>> s_refreshChecklist; // account_name, selected
 
     if (disabled) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
-    if (ImGui::Button("Refresh Account Data") && !disabled) {
-        HoardAndSeek::GW2API::FetchAccountDataAsync();
+    const auto& accounts = HoardAndSeek::GW2API::GetAccounts();
+    if (accounts.size() <= 1) {
+        // Single account: simple refresh button
+        if (ImGui::Button("Refresh Account Data") && !disabled) {
+            HoardAndSeek::GW2API::FetchAccountDataAsync();
+        }
+    } else {
+        // Multi-account: refresh button opens checklist popup
+        if (ImGui::Button("Refresh Account Data") && !disabled) {
+            s_refreshChecklist.clear();
+            for (const auto& acct : accounts) {
+                bool onCooldown = HoardAndSeek::GW2API::IsRefreshOnCooldown(acct.account_name);
+                s_refreshChecklist.push_back({acct.account_name, !onCooldown});
+            }
+            s_showRefreshPopup = true;
+            ImGui::OpenPopup("Refresh Accounts");
+        }
     }
     if (disabled) ImGui::PopStyleVar();
+
+    // Refresh checklist popup
+    if (ImGui::BeginPopup("Refresh Accounts")) {
+        ImGui::Text("Select accounts to refresh:");
+        ImGui::Separator();
+        for (auto& [name, selected] : s_refreshChecklist) {
+            bool onCooldown = HoardAndSeek::GW2API::IsRefreshOnCooldown(name);
+            // Find label for display
+            std::string display = name;
+            for (const auto& acct : accounts) {
+                if (acct.account_name == name && !acct.label.empty()) {
+                    display = acct.label;
+                    break;
+                }
+            }
+            if (onCooldown) {
+                ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+                ImGui::Checkbox(display.c_str(), &selected);
+                ImGui::PopStyleVar();
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "(cooldown)");
+                selected = false; // Can't select accounts on cooldown
+            } else {
+                ImGui::Checkbox(display.c_str(), &selected);
+            }
+        }
+        ImGui::Separator();
+        // Check if any selected
+        bool anySelected = false;
+        for (const auto& [name, selected] : s_refreshChecklist) {
+            if (selected) { anySelected = true; break; }
+        }
+        if (!anySelected) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+        if (ImGui::Button("Refresh Selected") && anySelected) {
+            std::vector<std::string> selected_accounts;
+            for (const auto& [name, selected] : s_refreshChecklist) {
+                if (selected) selected_accounts.push_back(name);
+            }
+            HoardAndSeek::GW2API::FetchAccountDataAsync(selected_accounts);
+            ImGui::CloseCurrentPopup();
+        }
+        if (!anySelected) ImGui::PopStyleVar();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
 
     // Timer flags for transient status messages (must be file-scope statics so InProgress can reset them)
     static bool s_successTimerStarted = false;
@@ -1313,7 +1654,7 @@ void AddonRender() {
         }
     } else if (!HoardAndSeek::GW2API::HasAccountData()) {
         ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
-            "No data. Set API key in settings first.");
+            accounts.empty() ? "No data. Add an account in settings." : "No data. Press Refresh.");
     } else if (HoardAndSeek::GW2API::HasAccountData()) {
         time_t last = HoardAndSeek::GW2API::GetLastUpdated();
         if (last > 0) {
@@ -1330,6 +1671,44 @@ void AddonRender() {
         }
     } else {
         ImGui::TextUnformatted("");
+    }
+
+    // Account filter combo (only shown when multiple accounts exist)
+    static std::string g_AccountFilter; // empty = all accounts
+    if (accounts.size() > 1) {
+        std::string combo_label = g_AccountFilter.empty() ? "All Accounts" : g_AccountFilter;
+        // Find display label
+        if (!g_AccountFilter.empty()) {
+            for (const auto& acct : accounts) {
+                if (acct.account_name == g_AccountFilter && !acct.label.empty()) {
+                    combo_label = acct.label;
+                    break;
+                }
+            }
+        }
+        ImGui::PushItemWidth(-1);
+        if (ImGui::BeginCombo("##acctfilter", combo_label.c_str())) {
+            if (ImGui::Selectable("All Accounts", g_AccountFilter.empty())) {
+                g_AccountFilter.clear();
+                // Re-run search with new filter
+                if ((int)strlen(g_SearchFilter) >= g_MinSearchLength) {
+                    g_SearchResults = HoardAndSeek::GW2API::SearchItems(std::string(g_SearchFilter), g_AccountFilter);
+                }
+            }
+            for (const auto& acct : accounts) {
+                std::string display = acct.label.empty() ? acct.account_name : acct.label;
+                bool selected = (g_AccountFilter == acct.account_name);
+                if (ImGui::Selectable(display.c_str(), selected)) {
+                    g_AccountFilter = acct.account_name;
+                    // Re-run search with new filter
+                    if ((int)strlen(g_SearchFilter) >= g_MinSearchLength) {
+                        g_SearchResults = HoardAndSeek::GW2API::SearchItems(std::string(g_SearchFilter), g_AccountFilter);
+                    }
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::PopItemWidth();
     }
 
     // Row 2: Search bar (always in a fixed position)
@@ -1356,8 +1735,9 @@ void AddonRender() {
             std::string query(g_SearchFilter);
             if ((int)query.length() >= g_MinSearchLength && !g_SearchPending) {
                 g_SearchPending = true;
-                std::thread([query]() {
-                    auto results = HoardAndSeek::GW2API::SearchItems(query);
+                std::string acctFilter = g_AccountFilter;
+                std::thread([query, acctFilter]() {
+                    auto results = HoardAndSeek::GW2API::SearchItems(query, acctFilter);
                     g_PendingSearchResults = std::move(results);
                     g_SearchResultsReady = true;
                     g_SearchPending = false;
@@ -1380,11 +1760,13 @@ void AddonRender() {
     RenderResultsList();
 
     ImGui::End();
+    PopGW2Theme();
 }
 
 // --- Options/Settings Render ---
 
 void AddonOptions() {
+    PushGW2Theme();
     ImGui::Text("Hoard & Seek Settings");
     if (ImGui::SmallButton("Homepage")) {
         ShellExecuteA(NULL, "open", "https://pie.rocks.cc/", NULL, NULL, SW_SHOWNORMAL);
@@ -1395,84 +1777,218 @@ void AddonOptions() {
     }
     ImGui::Separator();
 
-    // API Key section
-    ImGui::Text("GW2 API Key:");
-    ImGui::SameLine();
-    if (ImGui::SmallButton(g_ShowApiKey ? "Hide" : "Show")) {
-        g_ShowApiKey = !g_ShowApiKey;
-    }
-
-    ImGuiInputTextFlags flags = ImGuiInputTextFlags_None;
-    if (!g_ShowApiKey) flags |= ImGuiInputTextFlags_Password;
-    ImGui::PushItemWidth(-1);
-    ImGui::InputTextWithHint("##apikey", "Paste API key here...", g_ApiKeyBuf, sizeof(g_ApiKeyBuf), flags);
-    ImGui::PopItemWidth();
-
+    // --- Account Management ---
+    ImGui::Text("GW2 Accounts:");
     ImGui::Text("Required permissions: account, inventories, characters");
+    ImGui::Spacing();
 
     auto valStatus = HoardAndSeek::GW2API::GetValidationStatus();
     bool validating = (valStatus == HoardAndSeek::FetchStatus::InProgress);
     static bool pendingSave = false;
 
-    if (validating) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
-    if (ImGui::Button("Save Key") && !validating) {
-        HoardAndSeek::GW2API::SetApiKey(std::string(g_ApiKeyBuf));
-        HoardAndSeek::GW2API::ValidateApiKeyAsync();
-        pendingSave = true;
+    // Add new account
+    static char g_NewApiKeyBuf[256] = "";
+    static char g_NewLabelBuf[64] = "";
+    if (ImGui::CollapsingHeader("Add Account")) {
+        ImGui::Indent();
+        ImGui::AlignTextToFramePadding();
+        ImGui::Text("API Key:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(g_ShowApiKey ? "Hide" : "Show")) {
+            g_ShowApiKey = !g_ShowApiKey;
+        }
+        ImGuiInputTextFlags flags = ImGuiInputTextFlags_None;
+        if (!g_ShowApiKey) flags |= ImGuiInputTextFlags_Password;
+        ImGui::PushItemWidth(-1);
+        ImGui::InputTextWithHint("##newkey", "Paste API key here...", g_NewApiKeyBuf, sizeof(g_NewApiKeyBuf), flags);
+        ImGui::PopItemWidth();
+        ImGui::AlignTextToFramePadding();
+        ImGui::Text("Label:  ");
+        ImGui::SameLine();
+        ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x);
+        ImGui::InputTextWithHint("##newlabel", "Optional, e.g. 'Main Account'", g_NewLabelBuf, sizeof(g_NewLabelBuf));
+        ImGui::PopItemWidth();
+
+        if (validating) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+        if (ImGui::Button("Add & Validate") && !validating) {
+            std::string key(g_NewApiKeyBuf);
+            std::string label(g_NewLabelBuf);
+            int idx = HoardAndSeek::GW2API::AddAccount(key, label);
+            if (idx >= 0) {
+                // Validate using the raw key since account_name isn't known yet
+                HoardAndSeek::GW2API::ValidateAccountAsync(key);
+                pendingSave = true;
+                g_NewApiKeyBuf[0] = '\0';
+                g_NewLabelBuf[0] = '\0';
+                if (APIDefs) APIDefs->Events_Raise(EV_HOARD_ACCOUNTS_CHANGED, nullptr);
+            }
+        }
+        if (validating) ImGui::PopStyleVar();
+        ImGui::Unindent();
     }
-    if (validating) ImGui::PopStyleVar();
 
     // Auto-save when validation succeeds
     if (pendingSave && !validating) {
-        if (valStatus == HoardAndSeek::FetchStatus::Success) {
-            HoardAndSeek::GW2API::SaveApiKey();
-            pendingSave = false;
-        } else if (valStatus == HoardAndSeek::FetchStatus::Error) {
+        if (valStatus == HoardAndSeek::FetchStatus::Success || valStatus == HoardAndSeek::FetchStatus::Error) {
+            HoardAndSeek::GW2API::SaveAccounts();
             pendingSave = false;
         }
     }
 
-    // Validation status
     if (validating) {
-        ImGui::SameLine();
         ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "Validating...");
-    } else if (valStatus == HoardAndSeek::FetchStatus::Error) {
-        const auto& info = HoardAndSeek::GW2API::GetApiKeyInfo();
-        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Invalid: %s", info.error.c_str());
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Retry")) {
-            HoardAndSeek::GW2API::SetApiKey(std::string(g_ApiKeyBuf));
-            HoardAndSeek::GW2API::ValidateApiKeyAsync();
-            pendingSave = true;
-        }
     }
 
-    // Show key info when valid
-    const auto& info = HoardAndSeek::GW2API::GetApiKeyInfo();
-    if (info.valid) {
-        ImGui::Spacing();
-        ImGui::TextColored(ImVec4(0.35f, 0.82f, 0.35f, 1.0f), "Valid");
-        ImGui::Text("Account: %s", info.account_name.c_str());
-        ImGui::Text("Key Name: %s", info.key_name.c_str());
+    // Account list
+    ImGui::Spacing();
+    const auto& accounts = HoardAndSeek::GW2API::GetAccounts();
+    static std::string s_removeConfirm; // account_name pending removal confirmation
 
-        std::string perms;
-        for (size_t i = 0; i < info.permissions.size(); i++) {
-            if (i > 0) perms += ", ";
-            perms += info.permissions[i];
-        }
-        ImGui::Text("Scopes: %s", perms.c_str());
+    for (size_t i = 0; i < accounts.size(); i++) {
+        const auto& acct = accounts[i];
+        std::string display = acct.label.empty()
+            ? (acct.account_name.empty() ? ("Account " + std::to_string(i + 1)) : acct.account_name)
+            : acct.label;
 
-        // Check for required permissions
-        bool hasAccount = false, hasInventories = false, hasCharacters = false;
-        for (const auto& p : info.permissions) {
-            if (p == "account") hasAccount = true;
-            if (p == "inventories") hasInventories = true;
-            if (p == "characters") hasCharacters = true;
+        ImGui::PushID((int)i);
+        if (ImGui::CollapsingHeader(display.c_str())) {
+            ImGui::Indent();
+            if (acct.validated) {
+                ImGui::TextColored(ImVec4(0.35f, 0.82f, 0.35f, 1.0f), "Valid");
+            } else if (!acct.error.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Error: %s", acct.error.c_str());
+            } else {
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Not validated");
+            }
+
+            if (!acct.account_name.empty()) {
+                ImGui::Text("Account: %s", acct.account_name.c_str());
+            }
+
+            // Editable API Key
+            {
+                static std::unordered_map<std::string, std::array<char, 256>> s_keyBufs;
+                static std::unordered_map<std::string, bool> s_keyInit;
+                std::string id = acct.account_name.empty() ? acct.api_key : acct.account_name;
+                auto& buf = s_keyBufs[id];
+                if (!s_keyInit[id]) {
+                    strncpy(buf.data(), acct.api_key.c_str(), buf.size() - 1);
+                    buf[buf.size() - 1] = '\0';
+                    s_keyInit[id] = true;
+                }
+                float inputH = ImGui::GetFrameHeight();
+                float textH = ImGui::GetTextLineHeight();
+                float pad = (inputH - textH) * 0.5f;
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + pad);
+                ImGui::Text("API Key:");
+                ImGui::SameLine();
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() - pad);
+                ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x);
+                ImGui::InputText("##apikey", buf.data(), buf.size());
+                ImGui::PopItemWidth();
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    std::string newKey(buf.data());
+                    HoardAndSeek::GW2API::UpdateAccountKey(acct.account_name, newKey);
+                    HoardAndSeek::GW2API::SaveAccounts();
+                }
+            }
+
+            // Editable label — use a dummy framed widget height so text aligns vertically
+            {
+                static std::unordered_map<std::string, std::array<char, 64>> s_labelBufs;
+                static std::unordered_map<std::string, bool> s_labelInit;
+                std::string key = acct.account_name.empty() ? acct.api_key : acct.account_name;
+                auto& buf = s_labelBufs[key];
+                if (!s_labelInit[key]) {
+                    strncpy(buf.data(), acct.label.c_str(), buf.size() - 1);
+                    buf[buf.size() - 1] = '\0';
+                    s_labelInit[key] = true;
+                }
+                float inputH = ImGui::GetFrameHeight();
+                float textH = ImGui::GetTextLineHeight();
+                float pad = (inputH - textH) * 0.5f;
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + pad);
+                ImGui::Text("Label:");
+                ImGui::SameLine();
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() - pad);
+                ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x);
+                ImGui::InputTextWithHint("##label", "Custom label...", buf.data(), buf.size());
+                ImGui::PopItemWidth();
+                // Save only when the user finishes editing (clicks away, tabs out, presses Enter)
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    std::string newLabel(buf.data());
+                    HoardAndSeek::GW2API::UpdateAccountLabel(acct.account_name, newLabel);
+                    HoardAndSeek::GW2API::SaveAccounts();
+                }
+            }
+
+            if (!acct.permissions.empty()) {
+                std::string perms;
+                for (size_t pi = 0; pi < acct.permissions.size(); pi++) {
+                    if (pi > 0) perms += ", ";
+                    perms += acct.permissions[pi];
+                }
+                ImGui::Text("Scopes: %s", perms.c_str());
+
+                bool hasAccount = false, hasInventories = false, hasCharacters = false;
+                for (const auto& p : acct.permissions) {
+                    if (p == "account") hasAccount = true;
+                    if (p == "inventories") hasInventories = true;
+                    if (p == "characters") hasCharacters = true;
+                }
+                if (!hasAccount || !hasInventories || !hasCharacters) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f),
+                        "Warning: Missing required permissions");
+                }
+            }
+
+            if (acct.last_updated > 0) {
+                time_t now = std::time(nullptr);
+                int el = (int)difftime(now, acct.last_updated);
+                std::string ago;
+                if (el < 60) ago = "just now";
+                else if (el < 3600) ago = std::to_string(el / 60) + "m ago";
+                else if (el < 86400) ago = std::to_string(el / 3600) + "h ago";
+                else ago = std::to_string(el / 86400) + "d ago";
+                ImGui::Text("Last updated: %s", ago.c_str());
+            }
+
+            // Re-validate button
+            if (!validating) {
+                if (ImGui::SmallButton("Re-validate")) {
+                    std::string name = acct.account_name.empty() ? acct.api_key : acct.account_name;
+                    HoardAndSeek::GW2API::ValidateAccountAsync(name);
+                    pendingSave = true;
+                }
+                ImGui::SameLine();
+            }
+
+            // Remove button with confirmation
+            if (s_removeConfirm == acct.account_name) {
+                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Remove this account?");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Yes")) {
+                    HoardAndSeek::GW2API::RemoveAccount(acct.account_name);
+                    HoardAndSeek::GW2API::SaveAccounts();
+                    if (APIDefs) APIDefs->Events_Raise(EV_HOARD_ACCOUNTS_CHANGED, nullptr);
+                    s_removeConfirm.clear();
+                    ImGui::Unindent();
+                    ImGui::PopID();
+                    break; // Iterator invalidated
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("No")) {
+                    s_removeConfirm.clear();
+                }
+            } else {
+                if (ImGui::SmallButton("Remove")) {
+                    s_removeConfirm = acct.account_name;
+                }
+            }
+
+            ImGui::Unindent();
         }
-        if (!hasAccount || !hasInventories || !hasCharacters) {
-            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f),
-                "Warning: Missing required permissions. Need: account, inventories, characters");
-        }
+        ImGui::PopID();
     }
 
     ImGui::Spacing();
@@ -1496,6 +2012,7 @@ void AddonOptions() {
     ImGui::Separator();
     ImGui::Text("Addon Permissions:");
     HoardAndSeek::PermissionManager::RenderSettings();
+    PopGW2Theme();
 }
 
 // --- Export: GetAddonDef ---

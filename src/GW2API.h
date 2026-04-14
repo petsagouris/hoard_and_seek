@@ -17,6 +17,18 @@ namespace HoardAndSeek {
         std::string error;
     };
 
+    // Per-account configuration and state
+    struct AccountInfo {
+        std::string api_key;
+        std::string account_name;  // from /v2/account, e.g. "PieOrCake.7635"
+        std::string label;         // user-friendly, defaults to account_name
+        bool validated = false;
+        time_t last_updated = 0;
+        std::vector<std::string> permissions;
+        std::string error;         // last validation error
+        std::vector<std::string> characters; // character names from /v2/characters
+    };
+
     enum class FetchStatus {
         Idle,
         InProgress,
@@ -24,10 +36,11 @@ namespace HoardAndSeek {
         Error
     };
 
-    // Where an item was found on the account
+    // Where an item was found
     struct ItemLocation {
-        std::string location;  // "Bank", "Material Storage", "Shared Inventory", or character name
-        std::string sublocation; // "Bag", "Equipped", "Bank Tab 1", etc.
+        std::string account;      // Account name that owns this item
+        std::string location;     // "Bank", "Material Storage", "Shared Inventory", or character name
+        std::string sublocation;  // "Bag", "Equipped", "Bank Tab 1", etc.
         int count;
     };
 
@@ -61,47 +74,61 @@ namespace HoardAndSeek {
         // Data path helper
         static std::string GetDataDirectory();
 
-        // API Key management
-        static void SetApiKey(const std::string& key);
-        static const std::string& GetApiKey();
-        static bool LoadApiKey();
-        static bool SaveApiKey();
+        // --- Account Management ---
+        // Returns index of added account, or -1 on failure
+        static int AddAccount(const std::string& api_key, const std::string& label = "");
+        static bool RemoveAccount(const std::string& account_name);
+        static void UpdateAccountKey(const std::string& account_name, const std::string& new_key);
+        static void UpdateAccountLabel(const std::string& account_name, const std::string& label);
+        static const std::vector<AccountInfo>& GetAccounts();
+        static int GetAccountCount();
+        static bool SaveAccounts();
+        static bool LoadAccounts();
 
-        // Validation (async)
-        static void ValidateApiKeyAsync();
+        // --- Validation (async) ---
+        static void ValidateAccountAsync(const std::string& account_name);
+        static void ValidateAllAccountsAsync();
         static FetchStatus GetValidationStatus();
+        // Legacy compat: returns info for first account
         static const ApiKeyInfo& GetApiKeyInfo();
 
-        // Account data fetching (async) - scans all storage locations
-        static void FetchAccountDataAsync();
+        // --- Account data fetching (async) ---
+        // account_names: empty = fetch all accounts
+        static void FetchAccountDataAsync(const std::vector<std::string>& account_names = {});
         static FetchStatus GetFetchStatus();
         static const std::string& GetFetchStatusMessage();
 
-        // Query: has data been fetched?
+        // Query: has data been fetched for any account?
         static bool HasAccountData();
 
-        // Timestamp of last successful data fetch (0 if never)
+        // Timestamp of last successful data fetch (earliest across accounts, 0 if never)
         static time_t GetLastUpdated();
 
-        // Refresh cooldown: returns true if less than 5 min since last refresh
+        // Per-account cooldown
+        static bool IsRefreshOnCooldown(const std::string& account_name);
+        static time_t GetRefreshAvailableAt(const std::string& account_name);
+        // Legacy: returns true if ALL requested accounts are on cooldown
         static bool IsRefreshOnCooldown();
-        // Unix timestamp when refresh becomes available again (0 if available now)
         static time_t GetRefreshAvailableAt();
 
         // Search items by name substring (case-insensitive)
-        static std::vector<SearchResult> SearchItems(const std::string& query);
+        // account_filter: empty = all accounts
+        static std::vector<SearchResult> SearchItems(const std::string& query, const std::string& account_filter = "");
 
-        // Get all locations for a specific item ID
-        static std::vector<ItemLocation> GetItemLocations(uint32_t item_id);
+        // Get all locations for a specific item ID (optionally filtered by account)
+        static std::vector<ItemLocation> GetItemLocations(uint32_t item_id, const std::string& account_filter = "");
 
-        // Get total count of an item across all locations
-        static int GetTotalCount(uint32_t item_id);
+        // Get total count of an item across all locations (optionally filtered by account)
+        static int GetTotalCount(uint32_t item_id, const std::string& account_filter = "");
 
         // Get cached item info (name, icon, rarity)
         static const ItemInfo* GetItemInfo(uint32_t item_id);
 
-        // Authenticated API proxy (appends stored API key to URL)
-        static std::string AuthenticatedGet(const std::string& url);
+        // Authenticated API proxy (account_name: empty = first account)
+        static std::string AuthenticatedGet(const std::string& url, const std::string& account_name = "");
+
+        // Fetch /v2/characters for validated accounts that have empty character lists
+        static void FetchMissingCharacterListsAsync();
 
         // Persistence
         static bool LoadAccountData();
@@ -115,23 +142,23 @@ namespace HoardAndSeek {
 
     private:
         friend void TooltipWorker();
-        static std::string s_api_key;
+
+        // Account list
+        static std::vector<AccountInfo> s_accounts;
+        // Legacy compat (for GetApiKeyInfo)
         static ApiKeyInfo s_key_info;
         static FetchStatus s_validation_status;
+
         static FetchStatus s_fetch_status;
         static std::string s_fetch_message;
 
-        // item_id -> list of locations where it was found
+        // Merged item locations from all accounts (account tagged on each entry)
         static std::unordered_map<uint32_t, std::vector<ItemLocation>> s_item_locations;
 
-        // item_id -> cached item info from /v2/items
+        // Shared item info cache (names, icons, rarity are account-independent)
         static std::unordered_map<uint32_t, ItemInfo> s_item_cache;
 
-        // Wallet: currency_id -> amount
-        static std::unordered_map<int, int> s_wallet;
-
         static bool s_has_account_data;
-        static time_t s_last_updated;
         static std::mutex s_mutex;
 
         // HTTP helpers
@@ -146,9 +173,21 @@ namespace HoardAndSeek {
         static std::string CheckApiResponse(const HttpResponse& resp);
 
         static bool EnsureDataDirectory();
+        static std::string GetAccountDataDir(const std::string& account_name);
 
         // Fetch item details from /v2/items for a batch of IDs
         static void FetchItemDetails(const std::vector<uint32_t>& item_ids);
+
+        // Fetch a single account's data into the provided locations map
+        static bool FetchSingleAccount(const std::string& key, const std::string& account_name,
+            std::unordered_map<uint32_t, std::vector<ItemLocation>>& locations,
+            std::vector<uint32_t>& all_item_ids);
+
+        // Remove all entries for a given account from s_item_locations
+        static void ClearAccountLocations(const std::string& account_name);
+
+        // Merge fetched locations into s_item_locations
+        static void MergeLocations(const std::unordered_map<uint32_t, std::vector<ItemLocation>>& new_locations);
     };
 
 }

@@ -32,6 +32,7 @@ namespace HoardAndSeek {
         { EV_HOARD_QUERY_WIZARDSVAULT,  "Query Wizard's Vault progress" },
         { EV_HOARD_QUERY_API,           "Generic API proxy (any endpoint)" },
         { EV_HOARD_CONTEXT_MENU_REGISTER, "Register right-click context menu items" },
+        { EV_HOARD_QUERY_ACCOUNTS,       "Query configured account list" },
     };
 
     void PermissionManager::Init() {
