@@ -19,6 +19,7 @@
 #include "GW2API.h"
 #include "IconManager.h"
 #include "PermissionManager.h"
+#include "ProxyThrottle.h"
 #include "HoardAndSeekAPI.h"
 #include <nlohmann/json.hpp>
 
@@ -1153,50 +1154,72 @@ void OnQueryApi(void* eventArgs) {
     auto* req = (HoardQueryApiRequest*)eventArgs;
     if (req->api_version > HOARD_API_VERSION || req->api_version == 0) return;
     if (req->response_event[0] == '\0' || req->endpoint[0] == '\0') return;
-    uint8_t perm = CheckAddonPermission(req->requester, EV_HOARD_QUERY_API);
-    if (perm != HOARD_STATUS_OK) {
-        auto* resp = new HoardQueryApiResponse{};
-        resp->api_version = HOARD_API_VERSION;
-        resp->status = perm;
-        strncpy(resp->account_name, req->account_name, sizeof(resp->account_name) - 1);
-        strncpy(resp->endpoint, req->endpoint, sizeof(resp->endpoint) - 1);
-        resp->endpoint[sizeof(resp->endpoint) - 1] = '\0';
-        APIDefs->Events_Raise(req->response_event, resp);
-        return;
-    }
 
-    std::string endpoint(req->endpoint);
-    std::string response_event(req->response_event);
-    // v3+: read account name for key selection
+    const bool wants_v4 = (req->api_version >= 4);
+    const std::string requester(req->requester);
+    const std::string endpoint(req->endpoint);
+    const std::string response_event(req->response_event);
     std::string account_name;
     if (req->api_version >= 3 && req->account_name[0] != '\0') {
         account_name = std::string(req->account_name);
     }
 
-    std::thread([endpoint, response_event, account_name]() {
+    auto build_resp = [=](uint8_t status, const std::string& body,
+                          uint32_t retry_after_ms, uint32_t qdepth) {
         auto* resp = new HoardQueryApiResponse{};
         resp->api_version = HOARD_API_VERSION;
-        resp->status = HOARD_STATUS_OK;
+        resp->status = status;
         strncpy(resp->account_name, account_name.c_str(), sizeof(resp->account_name) - 1);
         strncpy(resp->endpoint, endpoint.c_str(), sizeof(resp->endpoint) - 1);
         resp->endpoint[sizeof(resp->endpoint) - 1] = '\0';
-
-        std::string url = "https://api.guildwars2.com" + endpoint;
-        std::string raw = HoardAndSeek::GW2API::AuthenticatedGet(url, account_name);
-
-        resp->json_length = (uint32_t)raw.length();
-        if (raw.length() >= sizeof(resp->json)) {
+        resp->json_length = (uint32_t)body.length();
+        if (body.length() >= sizeof(resp->json)) {
             resp->truncated = 1;
-            memcpy(resp->json, raw.c_str(), sizeof(resp->json) - 1);
+            memcpy(resp->json, body.c_str(), sizeof(resp->json) - 1);
             resp->json[sizeof(resp->json) - 1] = '\0';
         } else {
             resp->truncated = 0;
-            memcpy(resp->json, raw.c_str(), raw.length());
-            resp->json[raw.length()] = '\0';
+            memcpy(resp->json, body.c_str(), body.length());
+            resp->json[body.length()] = '\0';
         }
-
+        if (wants_v4) {
+            resp->retry_after_ms = retry_after_ms;
+            resp->queue_depth    = qdepth;
+            resp->tokens_remaining = 0;
+        }
         if (APIDefs) APIDefs->Events_Raise(response_event.c_str(), resp);
-    }).detach();
+    };
+
+    uint8_t perm = CheckAddonPermission(req->requester, EV_HOARD_QUERY_API);
+    if (perm != HOARD_STATUS_OK) {
+        build_resp(perm, "", 0, 0);
+        return;
+    }
+
+    std::string cached;
+    if (HoardAndSeek::ProxyThrottle::CacheLookup(account_name, endpoint, cached)) {
+        build_resp(HOARD_STATUS_OK, cached, 0,
+                   HoardAndSeek::ProxyThrottle::CurrentQueueDepth());
+        return;
+    }
+
+    auto fetch = [endpoint, account_name]() -> std::string {
+        std::string url = "https://api.guildwars2.com" + endpoint;
+        return HoardAndSeek::GW2API::AuthenticatedGet(url, account_name);
+    };
+    auto complete = [build_resp](const std::string& body) {
+        build_resp(HOARD_STATUS_OK, body, 0,
+                   HoardAndSeek::ProxyThrottle::CurrentQueueDepth());
+    };
+
+    auto sr = HoardAndSeek::ProxyThrottle::Submit(
+        requester, account_name, endpoint, std::move(fetch), std::move(complete));
+    if (!sr.accepted) {
+        uint32_t retry_ms = (uint32_t)(
+            (double)sr.queue_depth_after / HoardAndSeek::ProxyThrottle::RATE_REFILL_PER_SEC_MAX * 1000.0);
+        if (retry_ms < 500) retry_ms = 500;
+        build_resp(HOARD_STATUS_BUSY, "", retry_ms, sr.queue_depth_after);
+    }
 }
 
 void OnContextMenuRegister(void* eventArgs) {
@@ -1426,6 +1449,8 @@ void AddonLoad(AddonAPI_t* aApi) {
     APIDefs->Events_Subscribe(EV_HOARD_PING, OnPing);
     APIDefs->Events_Subscribe(EV_HOARD_QUERY_ACCOUNTS, OnQueryAccounts);
 
+    HoardAndSeek::ProxyThrottle::Start();
+
     // Notify other addons that cached data is available
     if (HoardAndSeek::GW2API::HasAccountData()) {
         BroadcastDataUpdated();
@@ -1435,6 +1460,7 @@ void AddonLoad(AddonAPI_t* aApi) {
 }
 
 void AddonUnload() {
+    HoardAndSeek::ProxyThrottle::Stop();
     HoardAndSeek::IconManager::Shutdown();
 
     APIDefs->Events_Unsubscribe(EV_HOARD_SEARCH, OnSearchRequest);
