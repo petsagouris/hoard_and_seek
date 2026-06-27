@@ -625,15 +625,14 @@ static void RenderResultsList() {
                 // Check if multiple accounts are present in results
                 std::unordered_set<std::string> acct_set;
                 for (const auto& loc : result.locations) acct_set.insert(loc.account);
-                size_t numAccounts = HoardAndSeek::GW2API::GetAccounts().size();
-                bool showAccountHeaders = (numAccounts > 1);
+                const auto accts = HoardAndSeek::GW2API::GetAccounts();
+                bool showAccountHeaders = (accts.size() > 1);
 
                 if (showAccountHeaders) {
                     // Group by account
                     for (const auto& acct_name : acct_set) {
                         // Find label
                         std::string acctDisplay = acct_name;
-                        const auto& accts = HoardAndSeek::GW2API::GetAccounts();
                         for (const auto& a : accts) {
                             if (a.account_name == acct_name && !a.label.empty()) {
                                 acctDisplay = a.label;
@@ -1496,7 +1495,7 @@ void OnQueryAccounts(void* eventArgs) {
     resp->status = HOARD_STATUS_OK;
     resp->account_count = 0;
 
-    const auto& accounts = HoardAndSeek::GW2API::GetAccounts();
+    const auto accounts = HoardAndSeek::GW2API::GetAccounts();
     for (size_t i = 0; i < accounts.size() && i < 16; i++) {
         auto& entry = resp->accounts[resp->account_count];
         strncpy(entry.account_name, accounts[i].account_name.c_str(), sizeof(entry.account_name) - 1);
@@ -1832,7 +1831,7 @@ void AddonRender() {
     static std::vector<std::pair<std::string, bool>> s_refreshChecklist; // account_name, selected
 
     if (disabled) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
-    const auto& accounts = HoardAndSeek::GW2API::GetAccounts();
+    const auto accounts = HoardAndSeek::GW2API::GetAccounts();
     if (accounts.size() <= 1) {
         // Single account: simple refresh button
         if (ImGui::Button("Refresh Account Data") && !disabled) {
@@ -2194,7 +2193,7 @@ void AddonOptions() {
 
     // Account list
     ImGui::Spacing();
-    const auto& accounts = HoardAndSeek::GW2API::GetAccounts();
+    const auto accounts = HoardAndSeek::GW2API::GetAccounts();
     static std::string s_removeConfirm; // account_name pending removal confirmation
 
     for (size_t i = 0; i < accounts.size(); i++) {

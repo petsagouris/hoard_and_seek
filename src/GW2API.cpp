@@ -287,7 +287,8 @@ namespace HoardAndSeek {
         }
     }
 
-    const std::vector<AccountInfo>& GW2API::GetAccounts() {
+    std::vector<AccountInfo> GW2API::GetAccounts() {
+        std::lock_guard<std::mutex> lock(s_mutex);
         return s_accounts;
     }
 
@@ -589,7 +590,8 @@ namespace HoardAndSeek {
         return s_validation_status;
     }
 
-    const ApiKeyInfo& GW2API::GetApiKeyInfo() {
+    ApiKeyInfo GW2API::GetApiKeyInfo() {
+        std::lock_guard<std::mutex> lock(s_mutex);
         return s_key_info;
     }
 
@@ -1187,7 +1189,8 @@ namespace HoardAndSeek {
         return s_fetch_status;
     }
 
-    const std::string& GW2API::GetFetchStatusMessage() {
+    std::string GW2API::GetFetchStatusMessage() {
+        std::lock_guard<std::mutex> lock(s_mutex);
         return s_fetch_message;
     }
 
