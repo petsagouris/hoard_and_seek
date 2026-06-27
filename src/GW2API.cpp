@@ -1356,17 +1356,25 @@ namespace HoardAndSeek {
     bool GW2API::SaveAccountData() {
         EnsureDataDirectory();
 
-        try {
-            // Save per-account data files
+        std::vector<AccountInfo> accounts_snap;
+        std::unordered_map<uint32_t, std::vector<ItemLocation>> locations_snap;
+        std::unordered_map<uint32_t, ItemInfo> cache_snap;
+        {
             std::lock_guard<std::mutex> lock(s_mutex);
-            for (const auto& acct : s_accounts) {
+            accounts_snap = s_accounts;
+            locations_snap = s_item_locations;
+            cache_snap = s_item_cache;
+        }
+
+        try {
+            for (const auto& acct : accounts_snap) {
                 if (acct.account_name.empty()) continue;
                 std::string dir = GetAccountDataDir(acct.account_name);
                 std::filesystem::create_directories(dir);
 
                 json j;
                 json items_json = json::object();
-                for (const auto& [item_id, locs] : s_item_locations) {
+                for (const auto& [item_id, locs] : locations_snap) {
                     json locs_json = json::array();
                     for (const auto& loc : locs) {
                         if (loc.account != acct.account_name) continue;
@@ -1389,9 +1397,8 @@ namespace HoardAndSeek {
                 file.flush();
             }
 
-            // Save shared item cache
             json cache_json = json::object();
-            for (const auto& [item_id, info] : s_item_cache) {
+            for (const auto& [item_id, info] : cache_snap) {
                 cache_json[std::to_string(item_id)] = {
                     {"name", info.name},
                     {"icon", info.icon_url},
