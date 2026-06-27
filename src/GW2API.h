@@ -81,7 +81,7 @@ namespace HoardAndSeek {
         static bool RemoveAccount(const std::string& account_name);
         static void UpdateAccountKey(const std::string& account_name, const std::string& new_key);
         static void UpdateAccountLabel(const std::string& account_name, const std::string& label);
-        static const std::vector<AccountInfo>& GetAccounts();
+        static std::vector<AccountInfo> GetAccounts();
         static int GetAccountCount();
         static bool SaveAccounts();
         static bool LoadAccounts();
@@ -91,13 +91,13 @@ namespace HoardAndSeek {
         static void ValidateAllAccountsAsync();
         static FetchStatus GetValidationStatus();
         // Legacy compat: returns info for first account
-        static const ApiKeyInfo& GetApiKeyInfo();
+        static ApiKeyInfo GetApiKeyInfo();
 
         // --- Account data fetching (async) ---
         // account_names: empty = fetch all accounts
         static void FetchAccountDataAsync(const std::vector<std::string>& account_names = {});
         static FetchStatus GetFetchStatus();
-        static const std::string& GetFetchStatusMessage();
+        static std::string GetFetchStatusMessage();
 
         // Query: has data been fetched for any account?
         static bool HasAccountData();
