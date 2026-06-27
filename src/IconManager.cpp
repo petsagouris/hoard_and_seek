@@ -1,9 +1,10 @@
 #include "IconManager.h"
+#include "GW2API.h"
 
 #include <windows.h>
 #include <wininet.h>
 #include <fstream>
-#include <sstream>
+#include <filesystem>
 #include <algorithm>
 
 namespace HoardAndSeek {
@@ -48,26 +49,13 @@ void IconManager::Shutdown() {
 
 std::string IconManager::GetIconsDir() {
     if (!s_IconsDir.empty()) return s_IconsDir;
-
-    char dllPath[MAX_PATH];
-    GetModuleFileNameA(NULL, dllPath, MAX_PATH);
-    std::string dllDir(dllPath);
-    size_t lastSlash = dllDir.find_last_of("\\/");
-    if (lastSlash != std::string::npos) {
-        dllDir = dllDir.substr(0, lastSlash);
-    }
-
-    std::string addonDir = dllDir + "\\addons\\HoardAndSeek";
-    CreateDirectoryA(addonDir.c_str(), NULL);
-    s_IconsDir = addonDir + "\\icons";
-    CreateDirectoryA(s_IconsDir.c_str(), NULL);
+    s_IconsDir = GW2API::GetDataDirectory() + "/icons";
+    std::filesystem::create_directories(s_IconsDir);
     return s_IconsDir;
 }
 
 std::string IconManager::GetIconFilePath(uint32_t itemId) {
-    std::stringstream ss;
-    ss << GetIconsDir() << "\\" << itemId << ".png";
-    return ss.str();
+    return GetIconsDir() + "/" + std::to_string(itemId) + ".png";
 }
 
 bool IconManager::DownloadToFile(const std::string& url, const std::string& filePath) {
@@ -116,9 +104,7 @@ bool IconManager::LoadIconFromDisk(uint32_t itemId) {
     DWORD attrs = GetFileAttributesA(filePath.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) return false;
 
-    std::stringstream ss;
-    ss << "GW2_ICON_" << itemId;
-    std::string identifier = ss.str();
+    std::string identifier = "GW2_ICON_" + std::to_string(itemId);
 
     try {
         Texture_t* tex = s_API->Textures_GetOrCreateFromFile(identifier.c_str(), filePath.c_str());
